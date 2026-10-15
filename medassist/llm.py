@@ -8,6 +8,10 @@ recall after a cold boot proves the core-memory hydration works.
 import json
 import os
 import re
+import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import date
 
 NUM = r"\d+(?:\.\d+)?"
@@ -230,7 +234,179 @@ class AnthropicLLM:
             return {"say": text}
 
 
-def get_llm():
-    if os.environ.get("MEDASSIST_LLM", "mock").lower() == "anthropic":
+# Defaults verified against the providers' current model listings. Keep these in
+# one place so users can change the default without touching request code.
+DEFAULT_MODELS = {
+    "groq": "openai/gpt-oss-120b",
+    "openrouter": "openai/gpt-oss-120b",
+}
+PROVIDER_CONFIG = {
+    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+}
+
+
+def _load_local_env():
+    """Load supported local .env values without replacing explicit shell values."""
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    try:
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                name, value = name.strip(), value.strip()
+                if name.startswith("export "):
+                    name = name[7:].strip()
+                if name not in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "MEDASSIST_MODEL"):
+                    continue
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                if value and not os.environ.get(name):
+                    os.environ[name] = value
+    except FileNotFoundError:
+        pass
+
+
+def _http_error_message(error, api_key: str) -> str:
+    """Return a short provider diagnostic with credentials and auth headers removed."""
+    try:
+        body = error.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        body = ""
+    if body:
+        try:
+            payload = json.loads(body)
+            detail = payload.get("error", payload.get("message", body))
+            if isinstance(detail, dict):
+                detail = detail.get("message", body)
+            body = str(detail)
+        except (ValueError, TypeError):
+            pass
+    else:
+        body = str(getattr(error, "reason", "request rejected"))
+    if api_key:
+        body = body.replace(api_key, "[REDACTED]")
+    body = re.sub(r"(?i)\bBearer\s+[^\s,;\"']+", "Bearer [REDACTED]", body)
+    body = re.sub(r"(?i)Authorization\s*[:=]\s*[^\r\n,;]+", "Authorization: [REDACTED]", body)
+    return body[:200]
+
+
+def _first_json_object(text: str):
+    """Parse the first balanced JSON object in text, ignoring surrounding prose."""
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        depth, in_string, escaped = 0, False, False
+        for end in range(start, len(text)):
+            c = text[end]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif c == "\\":
+                    escaped = True
+                elif c == '"':
+                    in_string = False
+            elif c == '"':
+                in_string = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        value = json.loads(text[start:end + 1])
+                    except (ValueError, json.JSONDecodeError):
+                        break
+                    if isinstance(value, dict):
+                        return value
+                    break
+    raise ValueError("No JSON object found")
+
+
+class OpenAICompatibleLLM:
+    """Stdlib OpenAI-compatible Chat Completions backend (Groq or OpenRouter)."""
+
+    def __init__(self, provider: str):
+        _load_local_env()
+        if provider not in PROVIDER_CONFIG:
+            raise ValueError(f"Unsupported OpenAI-compatible provider: {provider}")
+        self.provider = provider
+        self.name = provider
+        self.base_url, key_env = PROVIDER_CONFIG[provider]
+        self.api_key = os.environ.get(key_env, "")
+        if not self.api_key:
+            raise RuntimeError(f"{key_env} is required when MEDASSIST_LLM={provider}")
+        self.model = os.environ.get("MEDASSIST_MODEL", DEFAULT_MODELS[provider])
+
+    def _request(self, system: str, messages: list, json_mode: bool = True) -> str:
+        chat = [{"role": "system", "content": system}]
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role == "tool":
+                role, content = "user", f"[tool result] {content}"
+            if role not in ("user", "assistant"):
+                role = "user"
+            chat.append({"role": role, "content": content})
+        body = {"model": self.model, "messages": chat, "temperature": 0.1}
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions", data=json.dumps(body).encode("utf-8"),
+            headers={
+                "User-Agent": "medassist/1.0",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload["choices"][0]["message"]["content"] or ""
+
+    def complete(self, system: str, messages: list) -> dict:
+        raw = ""
+        last_error = None
+        json_mode = True
+        for attempt in range(3):  # initial request plus at most two retries
+            try:
+                raw = self._request(system, messages, json_mode=json_mode)
+                try:
+                    return _first_json_object(raw)
+                except (ValueError, TypeError):
+                    last_error = "invalid JSON response"
+            except urllib.error.HTTPError as exc:
+                message = _http_error_message(exc, self.api_key)
+                last_error = f"HTTP {exc.code}: {message}"
+                if 400 <= exc.code < 500 and exc.code != 429 and json_mode:
+                    # Model access and structured-output incompatibilities can both
+                    # produce 4xx responses; give the provider one plain-JSON retry.
+                    json_mode = False
+                elif exc.code == 429 or 500 <= exc.code < 600:
+                    pass
+                else:
+                    break
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError) as exc:
+                last_error = type(exc).__name__
+                break
+            if attempt < 2:
+                time.sleep(0.25 * (attempt + 1))
+        if last_error and last_error.startswith("HTTP "):
+            print(f"Warning: {self.provider} {last_error}.", file=sys.stderr)
+        else:
+            print(f"Warning: {self.provider} response fallback ({last_error or 'request failed'}).", file=sys.stderr)
+        return {"say": raw if raw else (last_error or "I couldn't reach the language model just now. Please try again.")}
+
+
+def get_llm(backend=None):
+    backend = (backend or os.environ.get("MEDASSIST_LLM", "mock")).lower()
+    if backend == "anthropic":
         return AnthropicLLM()
+    if backend in PROVIDER_CONFIG:
+        return OpenAICompatibleLLM(backend)
+    if backend != "mock":
+        raise ValueError(f"Unsupported MEDASSIST_LLM backend: {backend}")
     return MockLLM()

@@ -1,11 +1,13 @@
 """MemGPT-style agent: core memory in context, messages paged to archival when over budget."""
+import os
 import time
+from datetime import date
 
 from . import db
 from .archival import Archive
 from .llm import get_llm
 from .memory import DEFAULT_PERSONA, CoreMemory
-from .safety import HIGH, MEDIUM, classify_risk, decide
+from .safety import HIGH, MEDIUM, SELF_HARM, classify_risk, decide, identifiable_symptom
 from .tokens import est_tokens
 
 
@@ -99,7 +101,34 @@ class Agent:
         tool_log, reply = [], None
         risk, reason = classify_risk(user_text)
         escalated = False
-        for _ in range(self.MAX_HEARTBEATS):
+
+        def escalate(turn_risk, turn_reason):
+            nonlocal risk, reason, escalated
+            risk, reason, escalated = turn_risk, turn_reason, True
+            symptom = identifiable_symptom(user_text)
+            if symptom:
+                fact = f"Symptom ({date.today().isoformat()}): {symptom}"
+                res = self._run_tool("core_memory_append", {"block": "human_block", "fact": fact})
+                tool_log.append(f"core_memory_append(emergency symptom) -> {res}")
+                db.log_turn(self.conn, self.session_id, self.user_id, "tool", f"core_memory_append -> {res}")
+            if turn_risk == SELF_HARM:
+                response = (
+                    "ESCALATED: I'm sorry you're going through this. Please contact emergency services "
+                    f"({os.environ.get('MEDASSIST_EMERGENCY_NUMBER', 'your local emergency number (112 in India)')}) "
+                    "or a crisis line now, and reach out to someone nearby who can stay with you."
+                )
+            else:
+                response = (
+                    f"ESCALATED: {turn_reason.capitalize()}. Please contact a clinician or emergency "
+                    "services now."
+                )
+            db.log_escalation(self.conn, self.user_id, self.session_id, turn_risk, turn_reason)
+            return response
+
+        # Run the safety floor before any backend call; proposed writes are checked below too.
+        if risk in (HIGH, SELF_HARM):
+            reply = escalate(risk, reason)
+        for _ in range(self.MAX_HEARTBEATS if reply is None else 0):
             self._page_out_if_needed()
             system, msgs = self.build_context()
             out = self.llm.complete(system, msgs)
@@ -110,12 +139,10 @@ class Agent:
             ]
             turn_risk, turn_reason = classify_risk(user_text, proposed_writes)
             if turn_risk == HIGH:
-                risk, reason, escalated = HIGH, turn_reason, True
-                reply = (
-                    "ESCALATED: This may need urgent medical attention. Please contact a clinician or "
-                    "emergency services now."
-                )
-                db.log_escalation(self.conn, self.user_id, self.session_id, risk, reason)
+                reply = escalate(HIGH, turn_reason)
+                break
+            if turn_risk == SELF_HARM:
+                reply = escalate(SELF_HARM, turn_reason)
                 break
             if turn_risk == MEDIUM:
                 risk, reason = MEDIUM, turn_reason

@@ -1,4 +1,5 @@
 """Stdlib benchmark harness for the MedAssist persistent-memory demo."""
+import argparse
 import os
 import statistics
 import subprocess
@@ -9,6 +10,7 @@ import time
 from pathlib import Path
 
 from medassist.agent import Agent
+from medassist.llm import MockLLM, get_llm
 
 
 ROOT = Path(__file__).resolve().parent
@@ -45,7 +47,7 @@ def recall_benchmark(tmp):
     subprocess_plant(db_path, "recall_patient", "I started Aspirin 81 mg daily.")
     for user_text, _ in FACTS:
         subprocess_plant(db_path, "recall_patient", user_text)
-    agent = Agent(str(db_path), "recall_patient")
+    agent = Agent(str(db_path), "recall_patient", llm=MockLLM())
     # The stop parser only marks a medication discontinued when it is already recorded.
     agent._run_tool("core_memory_append", {"block": "human_block", "fact": "Medication: Aspirin 81 mg daily"})
     agent._persist()
@@ -65,7 +67,7 @@ def distractor_stress(tmp):
     for count in (5, 20, 50):
         db_path = tmp / f"distractors_{count}.sqlite"
         subprocess_plant(db_path, f"stress_{count}", "My doctor switched me from Metformin to Glimepiride 2 mg once daily.")
-        agent = Agent(str(db_path), f"stress_{count}")
+        agent = Agent(str(db_path), f"stress_{count}", llm=MockLLM())
         for i in range(count):
             fact = f"Symptom (2026-01-{(i % 28) + 1:02d}): irrelevant distractor symptom number {i + 1} with unrelated detail"
             agent._run_tool("core_memory_append", {"block": "human_block", "fact": fact})
@@ -90,10 +92,10 @@ def isolation_test(tmp):
         subprocess_plant(db_path, user, fact)
     # Give each user private archival data as well as core memory data.
     for user, fact in users.items():
-        a = Agent(str(db_path), user)
+        a = Agent(str(db_path), user, llm=MockLLM())
         a.archive.insert(f"PRIVATE_ARCHIVE_{user} confidential medical detail", "note")
         a.conn.close()
-    a = Agent(str(db_path), "patient_A")
+    a = Agent(str(db_path), "patient_A", llm=MockLLM())
     core = a.core.blocks["human_block"]
     hits = a.archive.search("confidential medical detail", k=20)
     archive_text = " ".join(hit["text"] for hit in hits)
@@ -111,7 +113,7 @@ def latency_benchmark(tmp):
     samples = []
     for i in range(200):
         start = time.perf_counter()
-        a = Agent(str(db_path), f"latency_{i}")
+        a = Agent(str(db_path), f"latency_{i}", llm=MockLLM())
         samples.append((time.perf_counter() - start) * 1000)
         a.conn.close()
     ordered = sorted(samples)
@@ -120,13 +122,50 @@ def latency_benchmark(tmp):
 
 
 def token_benchmark(tmp):
-    a = Agent(str(tmp / "tokens.sqlite"), "token_patient")
+    a = Agent(str(tmp / "tokens.sqlite"), "token_patient", llm=MockLLM())
     tokens = [a.step(f"Please tell me a brief neutral update number {i + 1}.")["tokens"] for i in range(20)]
     a.conn.close()
     return statistics.mean(tokens), max(tokens)
 
 
-def main():
+def live_model_probes(tmp, backend):
+    if backend == "mock":
+        return [(question, "SKIPPED (mock backend)") for question in (
+            "My doctor bumped my metformin up to 1000, twice a day",
+            "I've been out of my pills for 3 days",
+        )]
+    probe_db = tmp / "live_probes.sqlite"
+    try:
+        live_llm = get_llm(backend)
+        agent = Agent(str(probe_db), "live_probe_patient", llm=live_llm)
+    except Exception as exc:
+        return [("Live-model probe setup", f"SKIPPED ({type(exc).__name__})")]
+
+    agent._run_tool("core_memory_append", {
+        "block": "human_block", "fact": "Medication: Metformin 500 mg once daily",
+    })
+    agent._persist()
+    probes = [
+        ("My doctor bumped my metformin up to 1000, twice a day", "Metformin", "1000"),
+        ("I've been out of my pills for 3 days", "out", "3 days"),
+    ]
+    rows = []
+    try:
+        for question, expected_a, expected_b in probes:
+            result = agent.step(question)
+            memory = agent.core.blocks["human_block"].lower()
+            passed = expected_a.lower() in memory and expected_b.lower() in memory
+            rows.append((question, "PASS" if passed else "FAIL"))
+    finally:
+        agent.conn.close()
+    return rows
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run MedAssist memory benchmarks")
+    parser.add_argument("--llm", choices=("mock", "groq", "openrouter", "anthropic"), default="mock",
+                        help="backend for optional natural-language probes (default: mock)")
+    args = parser.parse_args(argv)
     work = Path(tempfile.mkdtemp(prefix=".benchmark_", dir=ROOT))
     try:
         tmp = work
@@ -135,12 +174,13 @@ def main():
         core_iso, archive_iso = isolation_test(tmp)
         latency_mean, latency_p95 = latency_benchmark(tmp)
         token_mean, token_peak = token_benchmark(tmp)
+        live_probes = live_model_probes(tmp, args.llm)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
     recall_pct = 100 * recall_hits / recall_total
     lines = [
-        "# MedAssist Benchmark Results", "", "Generated by `python benchmark.py` using the stdlib and mock LLM.", "",
+        "# MedAssist Benchmark Results", "", f"Generated by `python benchmark.py --llm {args.llm}` using the stdlib.", "",
         "## Multi-session recall", "", "| Probe | Gold fact | Result |", "|---|---|---|",
     ]
     lines.extend(f"| {q} | {gold} | {status} |" for q, gold, status, _ in recall_rows)
@@ -157,7 +197,9 @@ def main():
         f"| Multi-user isolation: patient A archival search | {'PASS' if archive_iso else 'FAIL'} |",
         f"| Cold-start construction, 200 iterations | mean {latency_mean:.3f} ms; p95 {latency_p95:.3f} ms |",
         f"| 20-turn context tokens | mean {token_mean:.1f}; peak {token_peak} |", "",
-        "Source changes: `medassist/llm.py` now answers name and discontinued-medication probes from existing core-memory lines. Distractor facts are added using the existing core-memory append and overflow path.", "",
+        "## Live-model probes", "", "| Probe | Result |", "|---|---|"])
+    lines.extend(f"| {question} | {status} |" for question, status in live_probes)
+    lines.extend(["", "Source changes: `medassist/llm.py` now answers name and discontinued-medication probes from existing core-memory lines. Distractor facts are added using the existing core-memory append and overflow path.", "",
     ])
     report = "\n".join(lines)
     (ROOT / "BENCHMARK.md").write_text(report, encoding="utf-8")
