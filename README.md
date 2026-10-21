@@ -21,6 +21,15 @@ python -m medassist.cli --llm openrouter --seed
 
 The clients use Python's standard library (`urllib.request` and `json`). The default models are `openai/gpt-oss-120b` for Groq and OpenRouter; change `DEFAULT_MODELS` in `medassist/llm.py` or override with `MEDASSIST_MODEL`. Anthropic remains available with `--llm anthropic` and its configured SDK/key. The rule-based safety floor always runs before model calls. To benchmark the natural-language probes against a live model, run `python benchmark.py --llm groq` or `python benchmark.py --llm openrouter`; they are marked skipped with the default mock.
 
+## Agentic and template modes
+
+The default `--mode agentic` keeps the existing tool-using assistant. Choose `--mode template` in the CLI or benchmark to have the LLM extract only structured facts; validated facts are stored through the same SQLite-backed memory tools, while short replies are filled deterministically from saved records. With `--llm mock`, extraction uses the offline regex extractor. Template mode is safer for predictable output because the model does not compose patient-facing replies, and the rule-based emergency safety floor still runs first.
+
+```powershell
+python -m medassist.cli --mode template --llm mock
+python benchmark.py --llm mock --mode template
+```
+
 ## Architecture (maps to the course notebooks)
 
 | Component | File | Notebook pattern |

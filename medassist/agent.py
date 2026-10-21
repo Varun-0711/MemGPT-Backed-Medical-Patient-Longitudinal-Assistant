@@ -5,9 +5,11 @@ from datetime import date
 
 from . import db
 from .archival import Archive
+from .extract import make_extractor
 from .llm import get_llm
 from .memory import DEFAULT_PERSONA, CoreMemory
 from .safety import HIGH, MEDIUM, SELF_HARM, classify_risk, decide, identifiable_symptom
+from . import templates
 from .tokens import est_tokens
 
 
@@ -17,10 +19,14 @@ class Agent:
     EVICT_TO = 600        # page down to this
     MAX_HEARTBEATS = 4
 
-    def __init__(self, db_path: str, user_id: str, llm=None):
+    def __init__(self, db_path: str, user_id: str, llm=None, mode: str = "agentic"):
+        if mode not in ("agentic", "template"):
+            raise ValueError("mode must be 'agentic' or 'template'")
         self.conn = db.connect(db_path)
         self.user_id = user_id
         self.llm = llm or get_llm()
+        self.mode = mode
+        self.extractor = make_extractor(self.llm) if mode == "template" else None
         self.session_id = f"s_{int(time.time() * 1000)}"
         db.create_session(self.conn, self.session_id, user_id)
         self.archive = Archive(self.conn, user_id)
@@ -95,6 +101,183 @@ class Agent:
         except Exception as e:  # tool errors go back to the model, never crash the loop
             return f"ERROR: {type(e).__name__}: {e}"
 
+    @staticmethod
+    def _fact_value(fields, *names):
+        for name in names:
+            value = fields.get(name)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    def _template_store_fact(self, item: dict, tool_log: list):
+        kind, fields = item["type"], item["fields"]
+        today = date.today().isoformat()
+        lines = [ln.strip() for ln in self.core.blocks["human_block"].splitlines() if ln.strip()]
+        new_line, old_line = "", None
+        if kind in ("medication_change", "medication_start", "medication_stop"):
+            med = self._fact_value(fields, "medication", "name", "drug", "medication_name")
+            old_med = self._fact_value(fields, "old_medication", "from", "old")
+            dose = self._fact_value(fields, "dose", "new_dose", "schedule", "frequency")
+            if kind == "medication_stop":
+                if not med:
+                    return ""
+                old_line = next((ln for ln in lines if ln.lower().startswith(f"medication: {med}".lower())), None)
+                new_line = f"Discontinued: {med} (stopped {today})"
+                if old_line:
+                    result = self._run_tool("core_memory_replace", {"block": "human_block", "old": old_line, "new": new_line})
+                    tool_log.append(f"core_memory_replace(medication stop) -> {result}")
+                    if result.startswith("SUCCESS"):
+                        self._archive_medication_history(old_line, new_line, tool_log)
+                else:
+                    result = self._run_tool("core_memory_append", {"block": "human_block", "fact": new_line})
+                    tool_log.append(f"core_memory_append(medication stop) -> {result}")
+            else:
+                if not med and kind == "medication_change" and old_med:
+                    old_line = next((ln for ln in lines if ln.lower().startswith(f"medication: {old_med}".lower())), None)
+                    med = old_med
+                if not med:
+                    return ""
+                new_line = f"Medication: {med} {dose}".strip()
+                if kind == "medication_change":
+                    if old_med:
+                        old_line = next((ln for ln in lines if ln.lower().startswith(f"medication: {old_med}".lower())), None)
+                    if not old_line:
+                        old_line = next((ln for ln in lines if ln.lower().startswith(f"medication: {med}".lower())), None)
+                if old_line:
+                    result = self._run_tool("core_memory_replace", {"block": "human_block", "old": old_line, "new": new_line})
+                    tool_log.append(f"core_memory_replace(medication) -> {result}")
+                    if result.startswith("SUCCESS") and kind == "medication_change":
+                        self._archive_medication_history(old_line, new_line, tool_log)
+                else:
+                    result = self._run_tool("core_memory_append", {"block": "human_block", "fact": new_line})
+                    tool_log.append(f"core_memory_append(medication) -> {result}")
+        elif kind == "vital":
+            name = self._fact_value(fields, "name", "vital", "type").lower()
+            value = self._fact_value(fields, "value", "reading", "measurement")
+            unit = self._fact_value(fields, "unit")
+            aliases = {
+                "bp": ("BP", "mmHg"), "blood pressure": ("BP", "mmHg"),
+                "glucose": ("Glucose", "mg/dL"), "blood sugar": ("Glucose", "mg/dL"),
+                "weight": ("Weight", "kg"), "hr": ("HR", "bpm"), "heart rate": ("HR", "bpm"),
+                "pulse": ("HR", "bpm"),
+            }
+            vital_name, default_unit = aliases.get(name, ("", ""))
+            if not vital_name or not value:
+                return ""
+            unit = unit or default_unit
+            value_with_unit = value if value.lower().endswith(unit.lower()) else f"{value} {unit}".strip()
+            prefix = f"Vital {vital_name}:"
+            new_line = f"{prefix} {value_with_unit} ({today})"
+            old_line = next((ln for ln in lines if ln.lower().startswith(prefix.lower())), None)
+            call_name = "core_memory_replace" if old_line else "core_memory_append"
+            args = {"block": "human_block", "old": old_line, "new": new_line} if old_line else {"block": "human_block", "fact": new_line}
+            result = self._run_tool(call_name, args)
+            tool_log.append(f"{call_name}(vital) -> {result}")
+        elif kind == "symptom":
+            description = self._fact_value(fields, "description", "symptom", "value")
+            if not description:
+                return ""
+            new_line = f"Symptom ({today}): {description}"
+            result = self._run_tool("core_memory_append", {"block": "human_block", "fact": new_line})
+            tool_log.append(f"core_memory_append(symptom) -> {result}")
+        elif kind == "allergy":
+            allergen = self._fact_value(fields, "allergen", "allergy", "value", "name")
+            if not allergen:
+                return ""
+            new_line = f"Allergy: {allergen}"
+            old_line = next((ln for ln in lines if ln.lower().startswith(f"allergy: {allergen}".lower())), None)
+            call_name = "core_memory_replace" if old_line else "core_memory_append"
+            args = {"block": "human_block", "old": old_line, "new": new_line} if old_line else {"block": "human_block", "fact": new_line}
+            result = self._run_tool(call_name, args)
+            tool_log.append(f"{call_name}(allergy) -> {result}")
+        elif kind == "adherence":
+            description = self._fact_value(fields, "description", "detail", "value")
+            medication = self._fact_value(fields, "medication", "drug")
+            if not description:
+                return ""
+            new_line = f"Adherence ({today}): {medication + ': ' if medication else ''}{description}"
+            result = self._run_tool("core_memory_append", {"block": "human_block", "fact": new_line})
+            tool_log.append(f"core_memory_append(adherence) -> {result}")
+        elif kind == "name":
+            name = self._fact_value(fields, "value", "name")
+            if not name:
+                return ""
+            new_line = f"Name: {name}"
+            old_line = next((ln for ln in lines if ln.lower().startswith("name:")), None)
+            call_name = "core_memory_replace" if old_line else "core_memory_append"
+            args = {"block": "human_block", "old": old_line, "new": new_line} if old_line else {"block": "human_block", "fact": new_line}
+            result = self._run_tool(call_name, args)
+            tool_log.append(f"{call_name}(name) -> {result}")
+        elif kind == "condition":
+            description = self._fact_value(fields, "description", "condition", "value")
+            if not description:
+                return ""
+            new_line = f"Condition: {description}"
+            if not any(ln.lower() == new_line.lower() for ln in lines):
+                result = self._run_tool("core_memory_append", {"block": "human_block", "fact": new_line})
+                tool_log.append(f"core_memory_append(condition) -> {result}")
+        else:
+            return ""
+        return new_line
+
+    def _archive_medication_history(self, old_line, new_line, tool_log):
+        result = self._run_tool("archival_insert", {
+            "text": f"Medication history ({date.today().isoformat()}): {old_line} -> {new_line}",
+            "kind": "medication_history",
+        })
+        tool_log.append(f"archival_insert(medication_history) -> {result}")
+
+    def _template_question(self, question):
+        # Fetch the persisted core block, so reply values always come from SQLite.
+        human = db.get_core_memory(self.conn, self.user_id).get("human_block", "")
+        lines = [line.strip() for line in human.splitlines() if line.strip()]
+        topic = question.get("topic", "other")
+        if topic == "medications":
+            return templates.medications([line.split(":", 1)[1].strip() for line in lines if line.startswith("Medication:")])
+        if topic == "vitals":
+            values = []
+            for line in lines:
+                if line.startswith("Vital "):
+                    values.append(line[len("Vital "):].replace(":", " ", 1))
+            return templates.vitals(values)
+        if topic == "symptoms":
+            return templates.symptoms([line.split(":", 1)[1].strip() for line in lines if line.startswith("Symptom ")])
+        if topic == "allergies":
+            return templates.allergies([line.split(":", 1)[1].strip() for line in lines if line.startswith("Allergy:")])
+        if topic == "labs_history":
+            hits = self.archive.search(question.get("query", ""), k=3)
+            return templates.history(hits[0]["text"] if hits else "")
+        if topic == "summary":
+            prefixes = ("Name:", "Condition:", "Allergy:", "Medication:", "Discontinued:", "Vital ", "Symptom ", "Adherence ")
+            return templates.summary([line for line in lines if line.startswith(prefixes)][:8])
+        return templates.generic()
+
+    def _step_template(self, user_text, risk, tool_log):
+        extracted = self.extractor.extract(user_text)
+        written = []
+        for fact in extracted["facts"]:
+            proposed = self._template_store_fact(fact, tool_log)
+            if proposed:
+                written.append(proposed)
+        if extracted["intent"] == "greeting" and not written:
+            return templates.greeting()
+        topic = extracted["question"].get("topic", "other")
+        if extracted["intent"] == "question" and topic != "other":
+            return self._template_question(extracted["question"])
+        if written:
+            # Only include candidate lines confirmed in the persisted human block.
+            saved_lines = set(db.get_core_memory(self.conn, self.user_id).get("human_block", "").splitlines())
+            confirmed = [line for line in written if line in saved_lines]
+            summary_parts = []
+            for line in confirmed:
+                value = line.split(":", 1)[-1].strip()
+                if line.startswith("Vital "):
+                    value = line[len("Vital "):].replace(":", " ", 1)
+                summary_parts.append(value)
+            note = "Please confirm this change with your prescriber." if risk == MEDIUM else ""
+            return templates.saved("; ".join(summary_parts), note)
+        return templates.generic()
+
     # ---- one patient turn (with heartbeat loop, Session 07A) -------------------------
     def step(self, user_text: str) -> dict:
         db.log_turn(self.conn, self.session_id, self.user_id, "user", user_text)
@@ -112,22 +295,26 @@ class Agent:
                 tool_log.append(f"core_memory_append(emergency symptom) -> {res}")
                 db.log_turn(self.conn, self.session_id, self.user_id, "tool", f"core_memory_append -> {res}")
             if turn_risk == SELF_HARM:
-                response = (
-                    "ESCALATED: I'm sorry you're going through this. Please contact emergency services "
-                    f"({os.environ.get('MEDASSIST_EMERGENCY_NUMBER', 'your local emergency number (112 in India)')}) "
-                    "or a crisis line now, and reach out to someone nearby who can stay with you."
+                response = templates.escalation(
+                    turn_reason, self_harm=True,
+                    emergency_number=os.environ.get(
+                        'MEDASSIST_EMERGENCY_NUMBER', 'your local emergency number (112 in India)'
+                    ),
                 )
             else:
-                response = (
-                    f"ESCALATED: {turn_reason.capitalize()}. Please contact a clinician or emergency "
-                    "services now."
-                )
+                response = templates.escalation(turn_reason)
             db.log_escalation(self.conn, self.user_id, self.session_id, turn_risk, turn_reason)
             return response
 
         # Run the safety floor before any backend call; proposed writes are checked below too.
         if risk in (HIGH, SELF_HARM):
             reply = escalate(risk, reason)
+        if self.mode == "template" and reply is None:
+            self._page_out_if_needed()
+            reply = self._step_template(user_text, risk, tool_log)
+            db.log_turn(self.conn, self.session_id, self.user_id, "assistant", reply)
+            self._page_out_if_needed()
+            return {"reply": reply, "tools": tool_log, "tokens": self.context_tokens()}
         for _ in range(self.MAX_HEARTBEATS if reply is None else 0):
             self._page_out_if_needed()
             system, msgs = self.build_context()

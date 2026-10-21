@@ -17,6 +17,8 @@ def main():
     p.add_argument("--show-core", action="store_true")
     p.add_argument("--llm", choices=("mock", "groq", "openrouter", "anthropic"), default="mock",
                    help="backend (default: mock)")
+    p.add_argument("--mode", choices=("agentic", "template"), default="agentic",
+                   help="reply mode (default: agentic)")
     p.add_argument("--check", action="store_true", help="send a tiny backend check and exit (Groq only)")
     a = p.parse_args()
 
@@ -43,7 +45,7 @@ def main():
 
     if a.seed:
         seed(a.db, a.user)
-    agent = Agent(a.db, a.user, llm=get_llm(a.llm))
+    agent = Agent(a.db, a.user, llm=get_llm(a.llm), mode=a.mode)
     print(f"[boot] session={agent.session_id} llm={agent.llm.name} "
           f"hydrated_blocks={list(agent.core.blocks)} context_messages=0 "
           f"ctx_tokens={agent.context_tokens()}/{agent.TOKEN_BUDGET}")
